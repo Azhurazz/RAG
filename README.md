@@ -1,6 +1,6 @@
 # RAG System
 
-> A production-grade Retrieval-Augmented Generation pipeline combining multi-source ingestion, conversational memory, knowledge graph retrieval, hybrid search, re-ranking, fine-tuning, and RAGAS evaluation — in one system with no mode switching.
+> A production-grade Retrieval-Augmented Generation pipeline combining multi-source ingestion, conversational memory, knowledge graph retrieval, hybrid search, re-ranking, fine-tuning, and RAGAS evaluation.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
 [![LangChain](https://img.shields.io/badge/LangChain-0.3-green)](https://python.langchain.com)
