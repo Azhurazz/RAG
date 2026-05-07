@@ -568,7 +568,7 @@ tests/
 ## Project structure
 
 ```
-unified-rag/
+rag/
 ├── src/
 │   ├── config.py                    # centralised settings (pydantic-settings)
 │   ├── pipeline.py                  # UnifiedRAGPipeline — the single entry point
@@ -592,17 +592,10 @@ unified-rag/
 │       └── main.py                  # FastAPI with all 13 endpoints
 ├── scripts/
 │   └── cli.py                       # Typer CLI — ingest, chat, eval, finetune, graph
-├── tests/
-│   ├── conftest.py                  # shared fixtures and pytest markers
-│   ├── unit/                        # fast tests, no API key required
-│   ├── integration/                 # mocked LLM, real ChromaDB
-│   └── eval/                        # real API, RAGAS metrics
 ├── configs/
 │   └── config.yaml                  # default pipeline configuration
 ├── .env.example                     # environment variable template
-├── requirements.txt                 # all Python dependencies
-├── pytest.ini                       # test markers and settings
-└── Makefile                         # test, coverage, and clean shortcuts
+└── requirements.txt                 # all Python dependencies
 ```
 
 ---
