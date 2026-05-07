@@ -1,4 +1,4 @@
-# Unified RAG System
+# RAG System
 
 > A production-grade Retrieval-Augmented Generation pipeline combining multi-source ingestion, conversational memory, knowledge graph retrieval, hybrid search, re-ranking, fine-tuning, and RAGAS evaluation — in one system with no mode switching.
 
@@ -56,7 +56,7 @@ User Question
       │
       ▼
 ┌─────────────────────────────────────────────────────┐
-│                  Unified RAG Pipeline                │
+│                       RAG Pipeline                   │
 │                                                      │
 │   Session Memory ──► Question Rewriter               │
 │         │                    │                       │
@@ -175,7 +175,7 @@ User Question
 ```bash
 # 1. Clone the repository
 git clone https://github.com/Azhurazz/RAG.git
-cd unified-rag
+cd rag
 
 # 2. Install Python dependencies
 pip install -r requirements.txt
