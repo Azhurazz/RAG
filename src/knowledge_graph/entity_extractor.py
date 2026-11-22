@@ -30,8 +30,8 @@ class Triple:
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """Extract entities and relationships from text.
 Return ONLY valid JSON (no markdown):
-{"entities":[{"name":"...","type":"...","description":"..."}],
- "triples":[{"subject":"...","relation":"...","object":"..."}]}
+{{"entities":[{{"name":"...","type":"...","description":"..."}}],
+ "triples":[{{"subject":"...","relation":"...","object":"..."}}]}}
 Entity types: Person,Organization,Concept,Technology,Method,Dataset,Framework,Tool
 Max 15 entities, 20 triples. Skip generic words. Relations: 2-4 word verb phrases."""),
     ("human", "Text:\n{text}"),
