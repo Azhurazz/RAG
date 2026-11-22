@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional
+from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -319,8 +320,10 @@ class RAGPipeline:
         if not ok:
             raise ValueError(f"Invalid training data: {msg}")
         train_id = ft.upload(train_path)
-        val_id   = ft.upload(val_path) if val_path else None
-        job      = ft.create_job(train_id, val_id, n_epochs=n_epochs)
+        val_id = None
+        if val_path and Path(val_path).exists() and Path(val_path).stat().st_size > 0:
+            val_id = ft.upload(val_path)
+        job = ft.create_job(train_id, val_id, n_epochs=n_epochs)
         if wait:
             model_id = ft.wait(job.id)
             return model_id
