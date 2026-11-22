@@ -43,6 +43,25 @@ class VectorStoreManager:
             self._store.add_documents(batch, ids=[d.metadata["chunk_id"] for d in batch])
         print(f"[vector_store] upserted {len(docs)} chunks")
 
+    def delete_by_origin(self, origins: List[str]) -> List[str]:
+        """
+        Delete every stored chunk whose `origin` metadata is in `origins`.
+        Used before re-ingesting a document, so edited content doesn't leave
+        stale chunks behind. Returns the deleted chunk ids.
+        """
+        if not origins:
+            return []
+        if self.settings.vector_db != "chroma":
+            print("[vector_store] delete_by_origin is only implemented for Chroma; "
+                  "old chunks of re-ingested documents may remain in Pinecone")
+            return []
+        where = {"origin": origins[0]} if len(origins) == 1 else {"origin": {"$in": origins}}
+        ids = self._store.get(where=where, include=[])["ids"]
+        if ids:
+            self._store.delete(ids=ids)
+            print(f"[vector_store] removed {len(ids)} old chunks of re-ingested sources")
+        return ids
+
     def similarity_search(self, query: str, k: int = 5,
                           filter: Optional[dict] = None) -> List[Document]:
         return self._store.similarity_search(query, k=k, filter=filter)
@@ -58,6 +77,9 @@ class VectorStoreManager:
 
     def get_all_documents(self) -> List[Document]:
         if self.settings.vector_db != "chroma":
+            print("[vector_store] get_all_documents is not supported for Pinecone: BM25 hybrid "
+                  "search, build_graph and training-data generation only see documents "
+                  "ingested in this process")
             return []
         data = self._store.get(include=["documents", "metadatas"])
         return [Document(page_content=t, metadata=m or {})

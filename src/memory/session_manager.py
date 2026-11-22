@@ -3,13 +3,16 @@ src/memory/session_manager.py
 Session memory (buffer / summary / vector) + standalone question rewriter.
 """
 from __future__ import annotations
+import hashlib
+import threading
 import uuid
-from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
+from typing import List, Literal, Optional
 
 from langchain.memory import ConversationBufferWindowMemory, ConversationSummaryBufferMemory, VectorStoreRetrieverMemory
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -47,7 +50,8 @@ class Session:
                  memory_strategy: MemoryStrategy = "buffer"):
         s = get_settings()
         self.session_id = session_id or str(uuid.uuid4())
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
+        self.last_used = self.created_at
         self.memory_strategy = memory_strategy
         self.turn_count = 0
         self._rewriter = StandaloneRewriter()
@@ -73,15 +77,20 @@ class Session:
         s = get_settings()
         emb = OpenAIEmbeddings(model=s.openai_embedding_model,
                                openai_api_key=s.openai_api_key)
-        self._store = Chroma(collection_name=f"memory_{self.session_id}",
+        # Chroma collection names must be 3-63 chars of [a-zA-Z0-9._-]; arbitrary
+        # session ids ("user 1", Thai text, long ids) would crash, so hash them.
+        safe = hashlib.sha1(self.session_id.encode("utf-8")).hexdigest()[:32]
+        self._store = Chroma(collection_name=f"memory_{safe}",
                              embedding_function=emb,
                              persist_directory=s.chroma_persist_dir + "_memory")
         self.memory = VectorStoreRetrieverMemory(
             retriever=self._store.as_retriever(search_kwargs={"k": 5}),
             memory_key="chat_history", input_key="input")
 
-    def rewrite(self, question: str) -> str:
-        return self._rewriter.rewrite(question, self.get_history(question))
+    def rewrite(self, question: str, history: Optional[List[BaseMessage]] = None) -> str:
+        if history is None:
+            history = self.get_history(question)
+        return self._rewriter.rewrite(question, history)
 
     def add_exchange(self, human: str, ai: str) -> None:
         self.memory.save_context({"input": human}, {"output": ai})
@@ -101,12 +110,20 @@ class Session:
 
     def clear(self) -> None:
         if self.memory_strategy == "vector":
-            self._store.delete_collection()  
-            self._make_vector_memory()      
+            self._store.delete_collection()
+            self._make_vector_memory()
         else:
             self.memory.clear()
         self.log.clear()
         self.turn_count = 0
+
+    def destroy(self) -> None:
+        """Free the session's storage for good (no empty collection left behind)."""
+        if self.memory_strategy == "vector":
+            try:
+                self._store.delete_collection()
+            except Exception as e:
+                print(f"[session] could not delete memory collection: {e}")
 
     def to_dict(self) -> dict:
         return {"session_id": self.session_id,
@@ -116,25 +133,59 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self):
-        self._sessions: Dict[str, Session] = {}
-        self._default = get_settings().default_memory_strategy
+    """
+    In-memory session registry with LRU + idle-TTL eviction, so random or
+    missing session ids can't grow memory without limit.
+    """
+
+    def __init__(self, max_sessions: Optional[int] = None,
+                 ttl_minutes: Optional[int] = None):
+        st = get_settings()
+        self._sessions: "OrderedDict[str, Session]" = OrderedDict()
+        self._default = st.default_memory_strategy
+        self._max = max_sessions or st.max_sessions
+        self._ttl = timedelta(minutes=ttl_minutes or st.session_ttl_minutes)
+        self._lock = threading.Lock()
 
     def get_or_create(self, session_id: str | None = None,
                       memory_strategy: MemoryStrategy | None = None) -> Session:
-        if session_id and session_id in self._sessions:
-            return self._sessions[session_id]
-        s = Session(session_id=session_id,
-                    memory_strategy=memory_strategy or self._default)
-        self._sessions[s.session_id] = s
-        return s
+        with self._lock:
+            self._evict_idle()
+            if session_id and session_id in self._sessions:
+                s = self._sessions[session_id]
+                if memory_strategy and memory_strategy != s.memory_strategy:
+                    raise ValueError(
+                        f"Session '{session_id}' uses memory strategy '{s.memory_strategy}', "
+                        f"not '{memory_strategy}'. Use a new session_id to change strategy.")
+                s.last_used = datetime.now(timezone.utc)
+                self._sessions.move_to_end(session_id)
+                return s
+            self._make_room()
+            s = Session(session_id=session_id,
+                        memory_strategy=memory_strategy or self._default)
+            self._sessions[s.session_id] = s
+            return s
 
     def get(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
 
-    def delete(self, session_id: str) -> None:
-        s = self._sessions.pop(session_id, None)
-        if s: s.clear()
+    def delete(self, session_id: str) -> bool:
+        with self._lock:
+            s = self._sessions.pop(session_id, None)
+        if s:
+            s.destroy()
+        return s is not None
 
     def list_all(self) -> List[dict]:
-        return [s.to_dict() for s in self._sessions.values()]
+        return [s.to_dict() for s in list(self._sessions.values())]
+
+    def _evict_idle(self) -> None:
+        now = datetime.now(timezone.utc)
+        for sid in [sid for sid, s in self._sessions.items() if now - s.last_used > self._ttl]:
+            self._sessions.pop(sid).destroy()
+
+    def _make_room(self) -> None:
+        # OrderedDict is kept in least-recently-used order (move_to_end on access)
+        while self._sessions and len(self._sessions) >= self._max:
+            _, oldest = self._sessions.popitem(last=False)
+            oldest.destroy()

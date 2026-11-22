@@ -30,6 +30,8 @@ Usage:
 """
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 from pathlib import Path
@@ -40,6 +42,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
 from src.config import get_settings
+from src.prompts import RAG_SYSTEM_TEMPLATE
 from src.evaluation.ragas_eval import EvalSample, RAGEvaluator
 from src.ingestion.chunking import ChunkConfig, ChunkStrategy
 from src.ingestion.loaders import MultiSourceLoader
@@ -47,6 +50,7 @@ from src.knowledge_graph.entity_extractor import EntityExtractor
 from src.knowledge_graph.neo4j_client import Neo4jClient
 from src.memory.session_manager import SessionManager
 from src.retrieval.hybrid_retriever import HybridRetriever
+from src.retrieval.parent_store import ParentStore
 from src.retrieval.reranker import get_reranker
 from src.retrieval.vector_store import VectorStoreManager
 from src.retrieval.utils import doc_key
@@ -56,21 +60,7 @@ from src.retrieval.utils import doc_key
 # ──────────────────────────────────────────────────────────────────────────────
 
 UNIFIED_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     """You are a precise, helpful AI assistant with access to a knowledge base.
-
-Answer the question using the provided context. The context contains:
-- Knowledge Graph section: entity relationships extracted from documents
-- Retrieved Chunks section: relevant document passages
-
-Guidelines:
-- Synthesise both KG relationships and document chunks for a complete answer
-- Be factual and grounded in the context
-- If context is insufficient, say so clearly
-- For follow-up questions, use the conversation history naturally
-
-Context:
-{context}"""),
+    ("system", RAG_SYSTEM_TEMPLATE),
     MessagesPlaceholder("history"),
     ("human", "{question}"),
 ])
@@ -149,10 +139,17 @@ class RAGPipeline:
         self._chain = UNIFIED_PROMPT | self.llm | StrOutputParser()
 
         # Lazy-loaded components
+        self._lock = threading.RLock()  # guards _all_docs / _hybrid_retriever across API threads
         self._hybrid_retriever: Optional[HybridRetriever] = None
         self._neo4j: Optional[Neo4jClient] = None
         self._neo4j_ok: Optional[bool] = None
-        self._all_docs: List[Document] = self.vsm.get_all_documents()
+        self._neo4j_checked_at: float = 0.0
+        self.parent_store = ParentStore(
+            str(Path(self.settings.chroma_persist_dir + "_parents") / f"{collection_name}.json"))
+        # Parent chunks are never indexed (older databases may still contain some).
+        self._all_docs: List[Document] = [
+            d for d in self.vsm.get_all_documents()
+            if d.metadata.get("chunk_level") != "parent"]
 
     # ──────────────────────────────────────
     #  Ingestion
@@ -173,13 +170,35 @@ class RAGPipeline:
         docs = loader.load_and_chunk(
             pdfs=pdfs, urls=urls, texts=texts, api_endpoints=api_endpoints
         )
-        self.vsm.add_documents(docs)
-        by_id = {d.metadata["chunk_id"]: d for d in self._all_docs}
-        for d in docs:
-            by_id[d.metadata["chunk_id"]] = d   # new version replaces old
-        self._all_docs = list(by_id.values())
-        self._hybrid_retriever = None  # reset so it rebuilds with new docs
-        return {"chunks_created": len(docs), "total_chunks": len(self._all_docs)}
+        # Hierarchical: index only children; keep parents aside for context expansion.
+        parents  = [d for d in docs if d.metadata.get("chunk_level") == "parent"]
+        children = [d for d in docs if d.metadata.get("chunk_level") != "parent"]
+
+        with self._lock:
+            # Re-ingesting a source replaces it: drop its old chunks first so
+            # edited text doesn't leave stale chunks in the index / graph.
+            origins = loader.origins
+            removed_ids = self.vsm.delete_by_origin(origins)
+            self.parent_store.delete_by_origin(origins)
+            if removed_ids and self._neo4j_available():
+                try:
+                    self._get_neo4j().delete_chunks(removed_ids)
+                except Exception as e:
+                    print(f"[pipeline] could not remove old chunks from Neo4j: {e}")
+
+            if children:
+                self.vsm.add_documents(children)
+            self.parent_store.add(parents)
+
+            origin_set = set(origins)
+            by_id = {d.metadata["chunk_id"]: d for d in self._all_docs
+                     if d.metadata.get("origin") not in origin_set}
+            for d in children:
+                by_id[d.metadata["chunk_id"]] = d
+            self._all_docs = list(by_id.values())
+            self._hybrid_retriever = None  # reset so it rebuilds with new docs
+        return {"chunks_created": len(children), "parent_chunks": len(parents),
+                "replaced_chunks": len(removed_ids), "total_chunks": len(self._all_docs)}
 
     def build_graph(self) -> dict:
         """Build the Neo4j knowledge graph from all ingested documents."""
@@ -210,10 +229,11 @@ class RAGPipeline:
         history = session.get_history(question)
 
         # 2. Rewrite follow-up questions using chat history
-        standalone_q = session.rewrite(question)
+        standalone_q = session.rewrite(question, history)
 
-        # 3. KG entity lookup
-        entity_names = self.entity_extractor.extract_names(standalone_q)
+        # 3. KG entity lookup (skip the extra LLM call when Neo4j is down)
+        entity_names = (self.entity_extractor.extract_names(standalone_q)
+                        if self._neo4j_available() else [])
         kg_context   = self._kg_context(entity_names)
         kg_docs      = self._kg_docs(entity_names)
 
@@ -223,8 +243,8 @@ class RAGPipeline:
         # 5. Merge + deduplicate KG-linked and hybrid results
         merged = self._merge_docs(kg_docs, hybrid_docs)
 
-        # 6. Re-rank
-        final_docs = self.reranker.rerank(standalone_q, merged)
+        # 6. Re-rank, then swap hierarchical children for their parent chunk
+        final_docs = self._expand_parents(self.reranker.rerank(standalone_q, merged))
 
         # 7. Assemble full context
         context = self._build_context(kg_context, final_docs)
@@ -370,13 +390,34 @@ class RAGPipeline:
     # ──────────────────────────────────────
 
     def _hybrid_retrieve(self, query: str) -> List[Document]:
-        if not self._hybrid_retriever and self._all_docs:
-            self._hybrid_retriever = HybridRetriever(
-                vsm=self.vsm, documents=self._all_docs, top_n=self.vector_k
-            )
-        if self._hybrid_retriever:
-            return self._hybrid_retriever.retrieve(query, k=self.vector_k)
+        with self._lock:
+            if not self._hybrid_retriever and self._all_docs:
+                self._hybrid_retriever = HybridRetriever(
+                    vsm=self.vsm, documents=self._all_docs, top_n=self.vector_k
+                )
+            retriever = self._hybrid_retriever
+        if retriever:
+            return retriever.retrieve(query, k=self.vector_k)
         return self.vsm.similarity_search(query, k=self.vector_k)
+
+    def _expand_parents(self, docs: List[Document]) -> List[Document]:
+        """Replace hierarchical child chunks with their parent (deduplicated)."""
+        out, seen = [], set()
+        for d in docs:
+            pid = d.metadata.get("parent_id")
+            parent = self.parent_store.get(pid) if pid else None
+            if parent is None:
+                key = doc_key(d)
+                if key not in seen:
+                    seen.add(key); out.append(d)
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            parent.metadata.update({k: d.metadata[k] for k in
+                                    ("retrieval", "rerank_score", "reranker") if k in d.metadata})
+            out.append(parent)
+        return out
 
     def _kg_context(self, entity_names: List[str]) -> str:
         if not entity_names or not self._neo4j_available():
@@ -431,8 +472,15 @@ class RAGPipeline:
             parts.append("")
         return "\n".join(parts)
 
+    NEO4J_RETRY_SECONDS = 60
+
     def _neo4j_available(self) -> bool:
-        if self._neo4j_ok is None:  # check once, cache the answer
+        # Cache the answer, but re-check a failed connection periodically so the
+        # KG turns on by itself if Neo4j starts after the app.
+        now = time.monotonic()
+        if self._neo4j_ok is None or (
+                not self._neo4j_ok and now - self._neo4j_checked_at > self.NEO4J_RETRY_SECONDS):
+            self._neo4j_checked_at = now
             try:
                 self._get_neo4j()._driver.verify_connectivity()
                 self._neo4j_ok = True
@@ -445,6 +493,10 @@ class RAGPipeline:
         if self._neo4j is None:
             self._neo4j = Neo4jClient()
         return self._neo4j
+
+    def get_neo4j(self) -> Neo4jClient:
+        """Shared Neo4j client (used by the API instead of one client per request)."""
+        return self._get_neo4j()
 
     def close(self) -> None:
         if self._neo4j:

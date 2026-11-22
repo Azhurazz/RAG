@@ -3,6 +3,8 @@ src/config.py — Unified RAG System
 Single settings class for all components.
 """
 from functools import lru_cache
+from typing import List
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,16 +33,29 @@ class Settings(BaseSettings):
     # Re-ranking
     cohere_api_key: str = ""
     reranker_backend: str = "cross_encoder"
+    # English-only defaults. For Thai / multilingual content use e.g.
+    # CROSS_ENCODER_MODEL=BAAI/bge-reranker-v2-m3 and COHERE_RERANK_MODEL=rerank-multilingual-v3.0
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    cohere_rerank_model: str = "rerank-english-v3.0"
 
     # Memory
     default_memory_strategy: str = "buffer"
     buffer_window_size: int = 10
     summary_max_tokens: int = 2000
+    max_sessions: int = 1000           # oldest idle sessions are evicted beyond this
+    session_ttl_minutes: int = 120     # sessions idle longer than this are evicted
 
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_secret_key: str = "change-me-in-production"
+    cors_origins: List[str] = ["http://localhost:3000"]
+    # All file paths sent to the API (PDFs, text files, JSONL, report/output dirs)
+    # must resolve inside this directory.
+    api_file_root: str = "./data"
+    # Allow /ingest to fetch URLs that resolve to private/loopback addresses.
+    allow_private_urls: bool = False
+    max_kg_depth: int = 4
 
     # LangSmith
     langchain_tracing_v2: bool = False

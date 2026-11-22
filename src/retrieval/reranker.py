@@ -3,7 +3,7 @@ src/retrieval/reranker.py
 CrossEncoder (local) and Cohere (API) re-rankers with auto-fallback.
 """
 from __future__ import annotations
-from typing import List, Literal
+from typing import List
 from langchain_core.documents import Document
 from src.config import get_settings
 
@@ -20,19 +20,20 @@ def get_reranker(backend: str | None = None, top_n: int = 5):
 
 
 class CrossEncoderReranker:
-    MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    _shared_models: dict = {}  # model name -> loaded CrossEncoder (load once per process)
 
-    def __init__(self, top_n: int = 5):
+    def __init__(self, top_n: int = 5, model_name: str | None = None):
         self.top_n = top_n
-        self._model = None
+        self.model_name = model_name or get_settings().cross_encoder_model
 
     def rerank(self, query: str, docs: List[Document]) -> List[Document]:
         if not docs: return docs
-        if self._model is None:
+        model = self._shared_models.get(self.model_name)
+        if model is None:
             from sentence_transformers import CrossEncoder
-            self._model = CrossEncoder(self.MODEL)
+            model = self._shared_models[self.model_name] = CrossEncoder(self.model_name)
         pairs = [(query, d.page_content) for d in docs]
-        scores = self._model.predict(pairs)
+        scores = model.predict(pairs)
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         result = [Document(page_content=d.page_content,
                    metadata={**d.metadata, "rerank_score": round(float(s), 4),
@@ -45,14 +46,20 @@ class CohereReranker:
     def __init__(self, top_n: int = 5):
         self.settings = get_settings()
         self.top_n = top_n
+        self._client = None
+        self._fallback = None
 
     def rerank(self, query: str, docs: List[Document]) -> List[Document]:
+        if not docs:
+            return docs
         try:
             import cohere
-            co = cohere.Client(self.settings.cohere_api_key)
+            if self._client is None:
+                self._client = cohere.Client(self.settings.cohere_api_key)
+            co = self._client
             texts = [d.page_content for d in docs]
             res = co.rerank(query=query, documents=texts,
-                            model="rerank-english-v3.0", top_n=self.top_n)
+                            model=self.settings.cohere_rerank_model, top_n=self.top_n)
             result = [Document(page_content=docs[r.index].page_content,
                                metadata={**docs[r.index].metadata,
                                          "rerank_score": round(float(r.relevance_score), 4),
@@ -61,7 +68,9 @@ class CohereReranker:
             return result
         except Exception as e:
             print(f"[cohere reranker] failed: {e}, falling back to CrossEncoder")
-            return CrossEncoderReranker(top_n=self.top_n).rerank(query, docs)
+            if self._fallback is None:
+                self._fallback = CrossEncoderReranker(top_n=self.top_n)
+            return self._fallback.rerank(query, docs)
 
 
 class PassthroughReranker:

@@ -1,5 +1,5 @@
 """
-scirpts/cli.py - RAG CLT
+scripts/cli.py - RAG CLI
 
 Commands:
     ingest  - Ingest from any source
@@ -71,13 +71,16 @@ def build_graph():
 def chat(
     question: Optional[str] = typer.Argument(None, help="Question"),
     session_id: str = typer.Option("cli-session", help="Session ID"),
-    memory: str = typer.Option("buffer", help="buffer | summary | vector"),
+    memory: Optional[str] = typer.Option(None, help="buffer | summary | vector (default: DEFAULT_MEMORY_STRATEGY)"),
     verbose: bool = typer.Option(False, help="Show retrieval details"),
 ):
     """Chat with the RAG system"""
     pipeline = get_pipeline()
     def ask(q: str):
-        result = pipeline.chat(q, session_id=session_id, memory_strategy=memory)
+        try:
+            result = pipeline.chat(q, session_id=session_id, memory_strategy=memory)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]"); return
         console.print(f"\n[bold cyan]Answer:[/bold cyan]\n{result.answer}")
         if verbose:
             console.print(f"\n[dim]Standalone Q: {result.standalone_question}[/dim]")
@@ -153,7 +156,7 @@ def ft_generate(
     manual_jsonl: Optional[str] = typer.Option(None, help="Path to manual JSONL file"),
     output_dir: str = typer.Option("data"),
 ):
-    """"Generate QA training data from ingested docs and KG"""
+    """Generate QA training data from ingested docs and KG"""
     result = get_pipeline().generate_training_data(
         n_per_chunk=n_per_chunk, max_chunks=max_chunks,
         include_kg=include_kg, manual_jsonl=manual_jsonl, output_dir=output_dir,
@@ -171,10 +174,14 @@ def ft_openai(
     wait: bool = typer.Option(True),
 ):
     """Start OpenAI fine-tuning"""
-    model_id = get_pipeline().finetune_openai(train, val, epochs, wait)
-    if model_id:
-        console.print(f"\n[bold green]Fine-tuned model:[/bold green] {model_id}")
-        console.print(f"[dim]Swap in with: python scripts/cli.py finetune swap-model {model_id}[/dim]")
+    result = get_pipeline().finetune_openai(train, val, epochs, wait)
+    if not wait:
+        console.print(f"\n[bold green]Fine-tuning job started:[/bold green] {result}")
+    elif result:
+        console.print(f"\n[bold green]Fine-tuned model:[/bold green] {result}")
+        console.print(f"[dim]Set OPENAI_CHAT_MODEL={result} in .env to use it[/dim]")
+    else:
+        console.print("[red]Fine-tuning job failed or was cancelled[/red]"); raise typer.Exit(1)
 
 @ft_app.command(name="lora-train")
 def ft_lora(
@@ -186,11 +193,11 @@ def ft_lora(
 ):
     """Fine-tune a local LLM with LoRA"""
     get_pipeline().finetune_lora(train, val, model, use_4bit, epochs)
-    console.print("[green]LoRA traning complete -> ./outputs/lora_model[/green]")
+    console.print("[green]LoRA training complete -> ./outputs/lora_model[/green]")
 
 @ft_app.command(name="swap-model")
 def ft_swap(model_id: str = typer.Argument(..., help="Fine-tuned model ID")):
-    """How swap the active LLM to a fine-tuned model"""
+    """Hot-swap the active LLM to a fine-tuned model (this CLI process only)"""
     get_pipeline().swap_model(model_id)
     console.print(f"[green]Now using: {model_id}[/green]")
 
