@@ -173,7 +173,10 @@ class RAGPipeline:
             pdfs=pdfs, urls=urls, texts=texts, api_endpoints=api_endpoints
         )
         self.vsm.add_documents(docs)
-        self._all_docs.extend(docs)
+        by_id = {d.metadata["chunk_id"]: d for d in self._all_docs}
+        for d in docs:
+            by_id[d.metadata["chunk_id"]] = d   # new version replaces old
+        self._all_docs = list(by_id.values())
         self._hybrid_retriever = None  # reset so it rebuilds with new docs
         return {"chunks_created": len(docs), "total_chunks": len(self._all_docs)}
 
