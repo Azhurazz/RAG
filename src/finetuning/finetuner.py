@@ -42,7 +42,7 @@ Rules: answerable from chunk only, 2-4 sentence answers, varied question types, 
 ])
 
 QUALITY_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", 'Score 0.0–1.0. Return ONLY: {{"score":0.85,"reason":"..."}}'),
+    ("system", 'Score 0.0–1.0. Return ONLY JSON: {{"score":0.85,"reason":"..."}}'),
     ("human", "Question:{question}\nAnswer:{answer}\nContext:{context}"),
 ])
 
