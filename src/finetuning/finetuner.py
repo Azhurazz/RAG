@@ -23,6 +23,7 @@ from rich.progress import track
 from rich.table import Table
 
 from src.config import get_settings
+from src.prompts import RAG_SYSTEM_TEMPLATE, format_chunk_context
 
 console = Console()
 
@@ -30,8 +31,6 @@ console = Console()
 #  Training Data Generator
 # ══════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = ("You are a domain expert assistant. Answer questions accurately, "
-                 "concisely, and factually.")
 
 QA_GEN_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """Generate {n} diverse Q&A pairs from the text.
@@ -110,11 +109,15 @@ class TrainingDataGenerator:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             for s in samples:
+                # Same system prompt + context layout the pipeline uses at inference,
+                # so the fine-tuned model learns to answer *from retrieved context*.
+                system = RAG_SYSTEM_TEMPLATE.format(
+                    context=format_chunk_context([(s.source, s.context)]))
                 f.write(json.dumps({"messages": [
-                    {"role": "system",    "content": SYSTEM_PROMPT},
+                    {"role": "system",    "content": system},
                     {"role": "user",      "content": s.question},
                     {"role": "assistant", "content": s.answer},
-                ]}) + "\n")
+                ]}, ensure_ascii=False) + "\n")
         print(f"[finetune] Saved {len(samples)} OpenAI samples → {path}")
 
     def save_alpaca_jsonl(self, samples: List[TrainingSample], path: str,
@@ -124,12 +127,13 @@ class TrainingDataGenerator:
             for s in samples:
                 f.write(json.dumps({"instruction": s.question,
                                      "input":       s.context[:800] if include_context else "",
-                                     "output":      s.answer}) + "\n")
+                                     "output":      s.answer}, ensure_ascii=False) + "\n")
         print(f"[finetune] Saved {len(samples)} Alpaca samples → {path}")
 
     def split(self, samples: List[TrainingSample],
-              val_ratio: float = 0.1) -> tuple[List[TrainingSample], List[TrainingSample]]:
-        random.shuffle(samples)
+              val_ratio: float = 0.1, seed: int = 42) -> tuple[List[TrainingSample], List[TrainingSample]]:
+        samples = list(samples)
+        random.Random(seed).shuffle(samples)  # reproducible split
         split = max(1, int(len(samples) * (1 - val_ratio)))
         return samples[:split], samples[split:]
 
@@ -153,19 +157,25 @@ class TrainingDataGenerator:
             return []
 
     def _filter(self, samples: List[TrainingSample]) -> List[TrainingSample]:
-        passed = []
+        # Fail closed: a sample we couldn't score is dropped, not kept, so a
+        # broken scorer can't silently let everything through.
+        passed, errors, last_err = [], 0, None
         for s in track(samples, description="[finetune] Quality scoring..."):
             try:
                 raw = self._score.invoke({"question": s.question,
                                           "answer":   s.answer,
                                           "context":  s.context[:1000]})
                 score = float(json.loads(raw).get("score", 0))
-                s.quality_score = score
-                if score >= self.quality_threshold:
-                    passed.append(s)
-            except Exception:
+            except Exception as e:
+                errors += 1; last_err = e
+                continue
+            s.quality_score = score
+            if score >= self.quality_threshold:
                 passed.append(s)
-        print(f"[finetune] Quality: {len(passed)}/{len(samples)} passed")
+        print(f"[finetune] Quality: {len(passed)}/{len(samples)} passed"
+              + (f", {errors} could not be scored (last error: {last_err})" if errors else ""))
+        if samples and errors == len(samples):
+            raise RuntimeError(f"Quality scoring failed for every sample: {last_err}")
         return passed
 
 # ══════════════════════════════════════════════════════════════
@@ -270,13 +280,17 @@ class LoRAConfig:
 class LoRAFinetuner:
     def __init__(self, config: LoRAConfig | None = None):
         self.config = config or LoRAConfig()
+        self._eos = ""
 
     def train(self, train_path: str, val_path: Optional[str] = None) -> None:
         self._check_gpu()
         model, tokenizer = self._load_model()
         model = self._apply_lora(model)
+        self._eos = tokenizer.eos_token or ""
         train_ds = self._load_dataset(train_path)
-        val_ds   = self._load_dataset(val_path) if val_path else None
+        val_ds   = (self._load_dataset(val_path)
+                    if val_path and Path(val_path).exists() and Path(val_path).stat().st_size > 0
+                    else None)
         self._run(model, tokenizer, train_ds, val_ds)
 
     def merge_and_save(self, adapter_path: Optional[str] = None) -> str:
@@ -302,13 +316,19 @@ class LoRAFinetuner:
             raise RuntimeError("No GPU detected. LoRA requires CUDA. Use OpenAI fine-tuning for CPU.")
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         console.print(f"[cyan]GPU: {torch.cuda.get_device_name(0)} | {vram:.1f}GB VRAM[/cyan]")
-        if vram < 6: raise RuntimeError(f"Insufficient VRAM ({vram:.1f}GB). Min 8GB for QLoRA.")
+        if vram < 8: raise RuntimeError(f"Insufficient VRAM ({vram:.1f}GB). Min 8GB for QLoRA.")
 
     def _load_model(self):
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
         tokenizer = AutoTokenizer.from_pretrained(self.config.base_model, trust_remote_code=True)
-        tokenizer.pad_token = tokenizer.eos_token
+        # Don't pad with EOS: the collator masks pad tokens out of the labels, so
+        # the model would never learn to emit EOS and wouldn't stop generating.
+        if tokenizer.pad_token is None:
+            if tokenizer.unk_token is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
         tokenizer.padding_side = "right"
         if self.config.use_4bit:
             bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
@@ -318,6 +338,8 @@ class LoRAFinetuner:
         else:
             model = AutoModelForCausalLM.from_pretrained(self.config.base_model,
                                                           torch_dtype=torch.float16, device_map="auto")
+        if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
+            model.resize_token_embeddings(len(tokenizer))
         return model, tokenizer
 
     def _apply_lora(self, model):
@@ -343,6 +365,7 @@ class LoRAFinetuner:
                 text = (f"### Instruction:\n{d['instruction']}\n\n### Input:\n{ctx}\n\n### Response:\n{d['output']}"
                         if ctx else
                         f"### Instruction:\n{d['instruction']}\n\n### Response:\n{d['output']}")
+                text += self._eos  # teach the model where an answer ends
                 records.append({"text": text})
         return Dataset.from_list(records)
 

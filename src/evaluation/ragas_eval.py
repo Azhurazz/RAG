@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -24,7 +24,7 @@ class EvalSample:
 
 @dataclass
 class EvalReport:
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     num_samples: int = 0
     metrics: Dict[str, float] = field(default_factory=dict)
     config: Dict = field(default_factory=dict)
@@ -56,16 +56,21 @@ class RAGEvaluator:
         if unknown:
             raise ValueError(f"Unknown metrics: {sorted(unknown)}")  # instead of silently dropping
         names = list(self.metrics_to_run)
-        if not any(s.ground_truth for s in samples):
+        # Ground-truth metrics need a ground_truth on *every* sample; filling the
+        # gaps with "" would silently drag context_recall etc. towards 0.
+        has_gt = all(s.ground_truth for s in samples)
+        if not has_gt:
             skipped = [m for m in names if m in NEEDS_GROUND_TRUTH]
             if skipped:
-                print(f"[eval] no ground_truth given, skipping {skipped}")
+                print(f"[eval] ground_truth missing on some samples, skipping {skipped}")
             names = [m for m in names if m not in NEEDS_GROUND_TRUTH]
+        if not names:
+            raise ValueError("No metrics left to run (all selected metrics need ground_truth)")
         data = {"question": [s.question for s in samples],
                 "answer":   [s.answer for s in samples],
                 "contexts": [s.contexts for s in samples]}
-        if any(s.ground_truth for s in samples):
-            data["ground_truth"] = [s.ground_truth or "" for s in samples]
+        if has_gt:
+            data["ground_truth"] = [s.ground_truth for s in samples]
         result = evaluate(dataset=Dataset.from_dict(data), metrics=[metric_map[m] for m in names])
         df = result.to_pandas()  # one row per sample, one column per metric
         return EvalReport(num_samples=len(samples),

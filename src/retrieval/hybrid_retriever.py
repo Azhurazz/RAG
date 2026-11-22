@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import List
 from langchain_core.documents import Document
 from src.retrieval.vector_store import VectorStoreManager
-from src.retrieval.utils import doc_key
+from src.retrieval.utils import doc_key, tokenize
 
 
 class HybridRetriever:
@@ -22,7 +22,7 @@ class HybridRetriever:
     def _build_bm25(self):
         try:
             from rank_bm25 import BM25Okapi
-            tokenized = [d.page_content.lower().split() for d in self.documents]
+            tokenized = [tokenize(d.page_content) for d in self.documents]
             self._bm25 = BM25Okapi(tokenized)
         except ImportError:
             print("[hybrid] rank_bm25 not installed — dense only")
@@ -31,9 +31,11 @@ class HybridRetriever:
         dense = self.vsm.similarity_search(query, k=k)
         if not self._bm25:
             return dense
-        scores = self._bm25.get_scores(query.lower().split())
+        scores = self._bm25.get_scores(tokenize(query))
         top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-        sparse = [self.documents[i] for i in top_idx]
+        # Drop zero-score hits: they share no terms with the query and would
+        # otherwise still earn an RRF bonus.
+        sparse = [self.documents[i] for i in top_idx if scores[i] > 0]
         return self._rrf(dense, sparse)
 
     def _rrf(self, a: List[Document], b: List[Document]) -> List[Document]:

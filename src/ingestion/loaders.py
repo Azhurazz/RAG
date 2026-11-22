@@ -12,12 +12,13 @@ import hashlib
 import httpx
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, WebBaseLoader
 from langchain_core.documents import Document
-from src.ingestion.chunking import ChunkConfig, ChunkStrategy, DocumentChunker
+from src.ingestion.chunking import ChunkConfig, DocumentChunker
 
 
 class MultiSourceLoader:
     def __init__(self, chunk_config: ChunkConfig | None = None):
         self.chunker = DocumentChunker(chunk_config or ChunkConfig())
+        self.origins: List[str] = []  # sources loaded by the last load_and_chunk() call
 
     def load_and_chunk(
         self,
@@ -31,6 +32,12 @@ class MultiSourceLoader:
         if urls:           raw.extend(self._urls(urls))
         if texts:          raw.extend(self._texts(texts))
         if api_endpoints:  raw.extend(self._apis(api_endpoints))
+        # `origin` uniquely identifies the source document (full path or URL).
+        # It is used to delete a document's old chunks when it is re-ingested.
+        for d in raw:
+            d.metadata.setdefault("origin", d.metadata.get("path") or d.metadata.get("url")
+                                  or d.metadata.get("source", "doc"))
+        self.origins = sorted({d.metadata["origin"] for d in raw})
         chunks = self.chunker.split(raw)
         for c in chunks:
             if "chunk_id" not in c.metadata:

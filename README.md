@@ -323,6 +323,9 @@ uvicorn src.api.main:app --reload --port 8000
 # Interactive API docs at http://localhost:8000/docs
 ```
 
+**Authentication:** every `/api/v1/*` endpoint requires the header `X-API-Key: <API_SECRET_KEY>`.
+File paths in requests (PDFs, text files, JSONL, output paths) are relative to `API_FILE_ROOT` (default `./data`) and cannot point outside it. URLs must resolve to public addresses unless `ALLOW_PRIVATE_URLS=true`.
+
 **All endpoints:**
 
 | Method | Endpoint | Description |
@@ -335,8 +338,9 @@ uvicorn src.api.main:app --reload --port 8000
 | `DELETE` | `/api/v1/sessions/{id}` | Delete a session and clear its memory |
 | `POST` | `/api/v1/evaluate` | Run RAGAS evaluation on provided samples |
 | `POST` | `/api/v1/finetune/generate-data` | Generate Q&A training data from ingested docs |
-| `POST` | `/api/v1/finetune/openai-train` | Upload data and start OpenAI fine-tuning job |
-| `POST` | `/api/v1/finetune/lora-train` | Start LoRA/QLoRA training (requires GPU) |
+| `POST` | `/api/v1/finetune/openai-train` | Upload data and start OpenAI fine-tuning job (returns a job ID) |
+| `POST` | `/api/v1/finetune/lora-train` | Start LoRA/QLoRA training in the background (requires GPU) |
+| `GET` | `/api/v1/finetune/jobs/{id}` | Status of a fine-tuning job started through the API |
 | `POST` | `/api/v1/finetune/swap-model` | Hot-swap the active LLM to a fine-tuned model |
 | `GET` | `/api/v1/graph/stats` | Entity, relationship, and chunk counts |
 | `GET` | `/api/v1/graph/entity/{name}` | Entity neighborhood traversal from Neo4j |
@@ -346,17 +350,17 @@ uvicorn src.api.main:app --reload --port 8000
 ```bash
 # Ingest
 curl -X POST http://localhost:8000/api/v1/ingest \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_SECRET_KEY" \
   -d '{"urls": ["https://docs.example.com"], "chunk_strategy": "hierarchical"}'
 
 # Chat
 curl -X POST http://localhost:8000/api/v1/chat \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_SECRET_KEY" \
   -d '{"question": "What is RAG?", "session_id": "user-1", "memory_strategy": "buffer"}'
 
 # Evaluate
 curl -X POST http://localhost:8000/api/v1/evaluate \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_SECRET_KEY" \
   -d '{
     "samples": [{
       "question": "What is RAG?",
@@ -494,10 +498,17 @@ tests/
 | `NEO4J_PASSWORD` | `password` | Neo4j password. **Change this in production.** |
 | `COHERE_API_KEY` | — | Optional. Enables Cohere reranker when set. |
 | `RERANKER_BACKEND` | `cross_encoder` | `cross_encoder`, `cohere`, or `none`. |
+| `CROSS_ENCODER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | English-only. Use `BAAI/bge-reranker-v2-m3` for Thai/multilingual. |
+| `COHERE_RERANK_MODEL` | `rerank-english-v3.0` | Use `rerank-multilingual-v3.0` for Thai/multilingual. |
 | `DEFAULT_MEMORY_STRATEGY` | `buffer` | `buffer`, `summary`, or `vector`. |
 | `BUFFER_WINDOW_SIZE` | `10` | Number of messages kept in buffer window memory. |
 | `SUMMARY_MAX_TOKENS` | `2000` | Token limit before summary memory compression triggers. |
-| `API_SECRET_KEY` | `change-me` | API authentication key. **Always change in production.** |
+| `MAX_SESSIONS` | `1000` | Least-recently-used sessions are evicted beyond this. |
+| `SESSION_TTL_MINUTES` | `120` | Idle sessions are evicted after this. |
+| `API_SECRET_KEY` | `change-me-in-production` | Sent by clients as the `X-API-Key` header. **Always change in production.** |
+| `CORS_ORIGINS` | `["http://localhost:3000"]` | JSON list of browser origins allowed to call the API. |
+| `API_FILE_ROOT` | `./data` | API request file paths must resolve inside this folder. |
+| `ALLOW_PRIVATE_URLS` | `false` | Allow `/ingest` to fetch localhost / private-network URLs. |
 | `LANGCHAIN_TRACING_V2` | `false` | Set `true` to enable LangSmith tracing. |
 | `LANGCHAIN_API_KEY` | — | Required when `LANGCHAIN_TRACING_V2=true`. |
 | `LANGCHAIN_PROJECT` | `unified-rag` | LangSmith project name for grouping traces. |

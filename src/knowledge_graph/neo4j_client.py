@@ -4,7 +4,7 @@ Neo4j driver wrapper — all Cypher queries in one place.
 Schema: (:Entity)-[:RELATED_TO]->(:Entity), (:Entity)-[:MENTIONED_IN]->(:Chunk)
 """
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from neo4j import GraphDatabase
 from src.config import get_settings
 
@@ -14,10 +14,14 @@ def _key(name: str) -> str:
 
 
 class Neo4jClient:
+    _schema_ready = False  # run the constraint/index DDL once per process, not per client
+
     def __init__(self):
         s = get_settings()
         self._driver = GraphDatabase.driver(s.neo4j_uri, auth=(s.neo4j_user, s.neo4j_password))
-        self._init_constraints()
+        if not Neo4jClient._schema_ready:
+            self._init_constraints()
+            Neo4jClient._schema_ready = True
 
     def _init_constraints(self):
         with self._driver.session() as s:
@@ -59,9 +63,18 @@ class Neo4jClient:
                 MERGE (e)-[:MENTIONED_IN]->(c)
             """, key=_key(entity_name), id=chunk_id)
 
+    def delete_chunks(self, chunk_ids: List[str]) -> None:
+        """Remove Chunk nodes (and their MENTIONED_IN links), e.g. when a document is re-ingested."""
+        if not chunk_ids:
+            return
+        with self._driver.session() as s:
+            s.run("MATCH (c:Chunk) WHERE c.chunk_id IN $ids DETACH DELETE c", ids=list(chunk_ids))
+
     def get_neighbors(self, name: str, depth: int = 2,
                       relation_filter: Optional[str] = None, limit: int = 20) -> List[Dict]:
-        filter_clause = "AND r.relation=$rel" if relation_filter else ""
+        depth = max(1, int(depth))
+        # r is a *list* of relationships in a variable-length match
+        filter_clause = "AND ALL(x IN r WHERE x.relation = $rel)" if relation_filter else ""
         with self._driver.session() as s:
             result = s.run(f"""
                 MATCH path=(start:Entity {{key:$key}})-[r:RELATED_TO*1..{depth}]->(end:Entity)
@@ -74,12 +87,17 @@ class Neo4jClient:
             return [dict(r) for r in result]
 
     def get_entity_chunks(self, name: str, depth: int = 2) -> List[Dict]:
+        depth = max(0, int(depth))
         with self._driver.session() as s:
+            # Closest chunks first: the caller keeps only the first few rows,
+            # so chunks mentioning the entity itself must not lose to 2-hop neighbours.
             result = s.run(f"""
-                MATCH (start:Entity {{key:$key}})-[:RELATED_TO*0..{depth}]->(e:Entity)
+                MATCH path=(start:Entity {{key:$key}})-[:RELATED_TO*0..{depth}]->(e:Entity)
                 MATCH (e)-[:MENTIONED_IN]->(c:Chunk)
-                RETURN DISTINCT c.chunk_id AS chunk_id, c.text AS text,
-                       c.source AS source, collect(DISTINCT e.name) AS entities
+                WITH c, e, length(path) AS hops
+                RETURN c.chunk_id AS chunk_id, c.text AS text, c.source AS source,
+                       collect(DISTINCT e.name) AS entities, min(hops) AS hops
+                ORDER BY hops ASC
                 LIMIT 20
             """, key=_key(name))
             return [dict(r) for r in result]
