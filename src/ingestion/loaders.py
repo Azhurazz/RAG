@@ -49,7 +49,8 @@ class MultiSourceLoader:
         for p in paths:
             pages = PyPDFLoader(p).load()
             for page in pages:
-                page.metadata.update({"source_type": "pdf", "source": Path(p).name})
+                page.metadata.update({"source_type": "pdf", "source": Path(p).name,
+                      "path": str(Path(p).resolve())})
             docs.extend(pages)
         return docs
 
@@ -71,7 +72,8 @@ class MultiSourceLoader:
         for p in paths:
             pages = TextLoader(p, encoding="utf-8").load()
             for page in pages:
-                page.metadata.update({"source_type": "text", "source": Path(p).name})
+                page.metadata.update({"source_type": "text", "source": Path(p).name,
+                      "path": str(Path(p).resolve())})
             docs.extend(pages)
         return docs
 
