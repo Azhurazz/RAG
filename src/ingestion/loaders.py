@@ -37,6 +37,10 @@ class MultiSourceLoader:
                 origin = c.metadata.get("url") or c.metadata.get("source", "doc")
                 id_src = f"{origin}|{c.metadata.get('page', '')}|{c.page_content}"
                 c.metadata["chunk_id"] = hashlib.sha1(id_src.encode()).hexdigest()[:16]
+        unique = {}
+        for c in chunks:
+            unique.setdefault(c.metadata["chunk_id"], c)
+        chunks = list(unique.values())
         print(f"[loader] {len(raw)} raw docs → {len(chunks)} chunks")
         return chunks
 
