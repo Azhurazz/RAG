@@ -78,7 +78,7 @@ class DocumentChunker:
         for doc in docs:
             parents = p_splitter.split_documents([doc])
             for pi, parent in enumerate(parents):
-                origin = doc.metadata.get("url") or doc.metadata.get("source", "doc")
+                origin = doc.metadata.get("url") or doc.metadata.get("path") or doc.metadata.get("source", "doc")
                 pid = f"{origin}::pg{doc.metadata.get('page', 0)}::p{pi}"
                 parent.metadata.update({"chunk_level": "parent", "chunk_id": pid,
                                         "chunk_strategy": "hierarchical"})
