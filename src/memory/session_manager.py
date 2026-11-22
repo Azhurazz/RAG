@@ -64,17 +64,21 @@ class Session:
                 llm=llm, max_token_limit=s.summary_max_tokens,
                 memory_key="chat_history", return_messages=True)
         elif memory_strategy == "vector":
-            from langchain_chroma import Chroma
-            emb = OpenAIEmbeddings(model=s.openai_embedding_model,
-                                   openai_api_key=s.openai_api_key)
-            store = Chroma(collection_name=f"memory_{self.session_id}",
-                           embedding_function=emb,
-                           persist_directory=s.chroma_persist_dir + "_memory")
-            self.memory = VectorStoreRetrieverMemory(
-                retriever=store.as_retriever(search_kwargs={"k": 5}),
-                memory_key="chat_history", input_key="input")
+            self._make_vector_memory()
         else:
             raise ValueError(f"Unknown memory strategy: {memory_strategy}")
+
+    def _make_vector_memory(self) -> None:
+        from langchain_chroma import Chroma
+        s = get_settings()
+        emb = OpenAIEmbeddings(model=s.openai_embedding_model,
+                               openai_api_key=s.openai_api_key)
+        self._store = Chroma(collection_name=f"memory_{self.session_id}",
+                             embedding_function=emb,
+                             persist_directory=s.chroma_persist_dir + "_memory")
+        self.memory = VectorStoreRetrieverMemory(
+            retriever=self._store.as_retriever(search_kwargs={"k": 5}),
+            memory_key="chat_history", input_key="input")
 
     def rewrite(self, question: str) -> str:
         return self._rewriter.rewrite(question, self.get_history(question))
@@ -96,7 +100,11 @@ class Session:
             for m in self.log.messages]
 
     def clear(self) -> None:
-        self.memory.clear()
+        if self.memory_strategy == "vector":
+            self._store.delete_collection()  
+            self._make_vector_memory()      
+        else:
+            self.memory.clear()
         self.log.clear()
         self.turn_count = 0
 
