@@ -48,8 +48,14 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     memory_strategy: Literal["buffer","summary","vector"] = "buffer"
 
+class EvalSampleIn(BaseModel):
+    question: str
+    answer: str
+    contexts: List[str]
+    ground_truth: Optional[str] = None
+
 class EvalRequest(BaseModel):
-    samples: List[dict]
+    samples: List[EvalSampleIn] = Field(..., min_length=1)
     metrics: Optional[List[str]] = None
     output: str = "reports/eval.json"
 
@@ -109,7 +115,7 @@ async def chat(req: ChatRequest):
 
 @app.post("/api/v1/evaluate")
 async def evaluate(req: EvalRequest):
-    samples = [EvalSample(**s) for s in req.samples]
+    samples = [EvalSample(**s.model_dump()) for s in req.samples]
     evaluator_kwargs = {"metrics": req.metrics} if req.metrics else {}
     from src.evaluation.ragas_eval import RAGEvaluator
     evaluator = RAGEvaluator(**evaluator_kwargs)
